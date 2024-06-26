@@ -17,7 +17,7 @@ go install github.com/likbezdev/walleter@latest
 walleter 1.0
 
 Usage:
-  walleter [options] -t <threads>
+  walleter [options] -t <threads> <suffix>...
   walleter -h | --help
   walleter --version
 
