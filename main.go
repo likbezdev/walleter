@@ -3,18 +3,27 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/hmac"
-	"crypto/rand"
+
+	//"crypto/rand"
 	"crypto/sha512"
 	"encoding/base64"
 	"log"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/colega/zeropool"
+	fastrand "github.com/valyala/fastrand"
+
 	"github.com/docopt/docopt-go"
-	"github.com/xdg-go/pbkdf2"
+	//"github.com/xdg-go/pbkdf2"
+
+	//"github.com/xdg-go/pbkdf2"
+	//"golang.org/x/crypto/pbkdf2"
+
+	pbkdf2 "github.com/ctz/go-fastpbkdf2"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/ton/wallet"
 )
@@ -56,15 +65,15 @@ type Arguments struct {
 var (
 	walletVersion = wallet.V4R2
 
-	walletPool = sync.Pool{
-		New: func() any {
-			return new(Wallet)
-		},
-	}
+	//walletPool = sync.Pool{
+	//    New: func() any {
+	//        return new(Wallet)
+	//    },
+	//}
 
-	seedPool = zeropool.New(func() []byte {
-		return make([]byte, _maxSeedSize)
-	})
+	//seedPool = zeropool.New(func() []byte {
+	//    return make([]byte, _maxSeedSize)
+	//})
 )
 
 func main() {
@@ -81,6 +90,26 @@ func main() {
 
 	for i, suffix := range args.Suffixes {
 		args.Suffixes[i] = strings.ToLower(suffix)
+	}
+
+	if os.Getenv("PPROF") != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
+		mux.HandleFunc("/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP)
+		mux.HandleFunc("/debug/pprof/threadcreate", pprof.Handler("threadcreate").ServeHTTP)
+		mux.HandleFunc("/debug/pprof/block", pprof.Handler("block").ServeHTTP)
+		mux.HandleFunc("/debug/pprof/mutex", pprof.Handler("mutex").ServeHTTP)
+
+		go func() {
+			if err := http.ListenAndServe(os.Getenv("PPROF"), mux); err != nil {
+				panic(err)
+			}
+		}()
 	}
 
 	//client := liteclient.NewConnectionPool()
@@ -138,7 +167,8 @@ func generate(fanout chan *Wallet) {
 	for {
 		seed, size, addr := NewWallet()
 
-		r := walletPool.Get().(*Wallet)
+		//r := walletPool.Get().(*Wallet)
+		r := &Wallet{}
 		r.Seed = seed
 		r.SeedSize = size
 		r.Addr = addr
@@ -156,31 +186,24 @@ const (
 )
 
 func NewWallet() ([]byte, int, *address.Address) {
-	seed := seedPool.Get()
+	//seed := seedPool.Get()
+	seed := make([]byte, _maxSeedSize)
 
 	for {
 		size := 0
 		for i := 0; i < _Words; i++ {
-			for {
-				x, err := rand.Int(rand.Reader, _wordsSize)
-				if err != nil {
-					continue
-				}
+			x := fastrand.Uint32n(_wordsSizeUint32)
 
-				for w := 0; w < len(wordsArr[x.Uint64()]); w++ {
-					seed[size+w] = wordsArr[x.Uint64()][w]
-				}
-
-				size += len(wordsArr[x.Uint64()])
-
-				if i != _Words-1 {
-					seed[size] = ' '
-					size += 1
-				}
-
-				break
+			for w := 0; w < len(wordsArr[x]); w++ {
+				seed[size+w] = wordsArr[x][w]
 			}
 
+			size += len(wordsArr[x])
+
+			if i != _Words-1 {
+				seed[size] = ' '
+				size += 1
+			}
 		}
 
 		mac := hmac.New(sha512.New, seed[:size])
@@ -199,8 +222,24 @@ func NewWallet() ([]byte, int, *address.Address) {
 			panic(err)
 		}
 
-		return seed, size, addr.Bounce(false)
+		addr.SetBounce(false)
+
+		return seed, size, addr
 	}
+}
+
+var walletLength = base64.RawURLEncoding.EncodedLen(36)
+
+func match(addr *address.Address, suffixes []string) bool {
+	for i := 0; i < len(suffixes); i++ {
+		if suffixes[i] == strings.ToLower(
+			addr.String()[walletLength-len(suffixes[i]):],
+		) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func filter(
@@ -215,25 +254,13 @@ func filter(
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
-	walletLength := base64.RawURLEncoding.EncodedLen(36)
-
 	lastTick := started
 	lastTotal := 0
 
 	for {
 		select {
 		case wallet := <-fanout:
-			found := false
-			for i := 0; i < len(suffixes); i++ {
-				if suffixes[i] == strings.ToLower(
-					wallet.Addr.String()[walletLength-len(suffixes[i]):],
-				) {
-					found = true
-					break
-				}
-			}
-
-			if found {
+			if match(wallet.Addr, suffixes) {
 				_, err := seedFile.WriteString(
 					wallet.Addr.String() + " " + string(wallet.Seed[:wallet.SeedSize]) + "\n",
 				)
@@ -262,13 +289,14 @@ func filter(
 					float64(total)/time.Since(started).Seconds(),
 					"avg w/m:",
 					float64(total)/time.Since(started).Minutes(),
+					"queue load:", float64(len(fanout))/float64(cap(fanout))*100.0,
 				)
 			}
 
-			seedPool.Put(wallet.Seed)
-			wallet.Addr = nil
-			wallet.Seed = nil
-			walletPool.Put(wallet)
+			//seedPool.Put(wallet.Seed)
+			//wallet.Addr = nil
+			//wallet.Seed = nil
+			//walletPool.Put(wallet)
 
 		case <-ticker.C:
 			log.Println(

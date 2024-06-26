@@ -14,6 +14,10 @@ go install github.com/likbezdev/walleter@latest
 ## Usage
 
 ```
+GOGC=1000 sudo -E nice -n -19 ~/go/bin/walleter -t 1000 SUFF
+```
+
+```
 walleter 1.0
 
 Usage:
