@@ -1,16 +1,21 @@
 package main
 
 import (
-	"context"
+	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha512"
+	"encoding/base64"
 	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/colega/zeropool"
 	"github.com/docopt/docopt-go"
-	"github.com/xssnick/tonutils-go/liteclient"
-	"github.com/xssnick/tonutils-go/ton"
+	"github.com/xdg-go/pbkdf2"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/ton/wallet"
 )
 
@@ -22,7 +27,7 @@ var (
 	usage = `walleter 1.0
 
 Usage:
-  walleter [options] -t <threads>
+  walleter [options] -t <threads> <suffix>...
   walleter -h | --help
   walleter --version
 
@@ -36,19 +41,34 @@ Options:
 )
 
 type Wallet struct {
-	Address string
-	Seed    []string
+	Addr     *address.Address
+	Seed     []byte
+	SeedSize int
 }
 
 type Arguments struct {
 	Threads   int
 	Addresses string
 	Seeds     string
+	Suffixes  []string `docopt:"<suffix>"`
 }
+
+var (
+	walletVersion = wallet.V4R2
+
+	walletPool = sync.Pool{
+		New: func() any {
+			return new(Wallet)
+		},
+	}
+
+	seedPool = zeropool.New(func() []byte {
+		return make([]byte, _maxSeedSize)
+	})
+)
 
 func main() {
 	var args Arguments
-
 	opts, err := docopt.ParseDoc(usage)
 	if err != nil {
 		log.Fatalf("parse doc: %v", err)
@@ -59,19 +79,23 @@ func main() {
 		log.Fatalf("parse args: %v", err)
 	}
 
-	client := liteclient.NewConnectionPool()
-
-	err = client.AddConnectionsFromConfigUrl(
-		context.Background(),
-		_globalConfigURL,
-	)
-	if err != nil {
-		log.Fatalf("initialize liteclient: %v", err)
+	for i, suffix := range args.Suffixes {
+		args.Suffixes[i] = strings.ToLower(suffix)
 	}
 
-	api := ton.NewAPIClient(client).WithRetry()
+	//client := liteclient.NewConnectionPool()
 
-	fanout := make(chan *Wallet, 1000)
+	//err = client.AddConnectionsFromConfigUrl(
+	//    context.Background(),
+	//    _globalConfigURL,
+	//)
+	//if err != nil {
+	//    log.Fatalf("initialize liteclient: %v", err)
+	//}
+
+	//api := ton.NewAPIClient(client).WithRetry()
+
+	fanout := make(chan *Wallet, 10000)
 
 	addrFile, err := os.OpenFile(
 		args.Addresses,
@@ -93,67 +117,163 @@ func main() {
 	}
 	defer seedFile.Close()
 
-	go handleOutput(fanout, addrFile, seedFile)
-
 	wg := sync.WaitGroup{}
+
 	wg.Add(args.Threads)
 	for i := 0; i < args.Threads; i++ {
 		go func() {
 			defer wg.Done()
 
-			for {
-				generate(api, fanout)
-			}
+			generate(fanout)
 		}()
 	}
+
+	// probably should add wg here too
+	go filter(args.Suffixes, fanout, addrFile, seedFile)
 
 	wg.Wait()
 }
 
-func generate(api ton.APIClientWrapped, fanout chan *Wallet) {
-	seed := wallet.NewSeed()
+func generate(fanout chan *Wallet) {
+	for {
+		seed, size, addr := NewWallet()
 
-	w, err := wallet.FromSeed(api, seed, wallet.V4R2)
-	if err != nil {
-		log.Fatalln("FromSeed err:", err.Error())
-		return
+		r := walletPool.Get().(*Wallet)
+		r.Seed = seed
+		r.SeedSize = size
+		r.Addr = addr
+
+		fanout <- r
 	}
-
-	result := &Wallet{
-		Address: w.WalletAddress().String(),
-		Seed:    seed,
-	}
-
-	fanout <- result
 }
 
-func handleOutput(fanout chan *Wallet, addrFile, seedFile *os.File) {
+const (
+	_Iterations   = 100000
+	_Salt         = "TON default seed"
+	_BasicSalt    = "TON seed version"
+	_PasswordSalt = "TON fast seed version"
+	_Words        = 24
+)
+
+func NewWallet() ([]byte, int, *address.Address) {
+	seed := seedPool.Get()
+
+	for {
+		size := 0
+		for i := 0; i < _Words; i++ {
+			for {
+				x, err := rand.Int(rand.Reader, _wordsSize)
+				if err != nil {
+					continue
+				}
+
+				for w := 0; w < len(wordsArr[x.Uint64()]); w++ {
+					seed[size+w] = wordsArr[x.Uint64()][w]
+				}
+
+				size += len(wordsArr[x.Uint64()])
+
+				if i != _Words-1 {
+					seed[size] = ' '
+					size += 1
+				}
+
+				break
+			}
+
+		}
+
+		mac := hmac.New(sha512.New, seed[:size])
+		hash := mac.Sum(nil)
+
+		p := pbkdf2.Key(hash, []byte(_BasicSalt), _Iterations/256, 1, sha512.New)
+		if p[0] != 0 {
+			continue
+		}
+
+		k := pbkdf2.Key(hash, []byte(_Salt), _Iterations, 32, sha512.New)
+		key := ed25519.NewKeyFromSeed(k)
+
+		addr, err := wallet.AddressFromPubKey(key.Public().(ed25519.PublicKey), walletVersion, wallet.DefaultSubwallet)
+		if err != nil {
+			panic(err)
+		}
+
+		return seed, size, addr.Bounce(false)
+	}
+}
+
+func filter(
+	suffixes []string,
+	fanout chan *Wallet,
+	addrFile *os.File,
+	seedFile *os.File,
+) {
 	total := 0
 	started := time.Now()
-	for wallet := range fanout {
-		_, err := seedFile.WriteString(
-			wallet.Address + " " + strings.Join(wallet.Seed, " ") + "\n",
-		)
-		if err != nil {
-			log.Fatalln("write seed file:", err.Error())
-			return
-		}
 
-		_, err = addrFile.WriteString(wallet.Address + "\n")
-		if err != nil {
-			log.Fatalln("write addr file:", err.Error())
-			return
-		}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 
-		total++
-		if total%1000 == 0 {
+	walletLength := base64.RawURLEncoding.EncodedLen(36)
+
+	lastTick := started
+	lastTotal := 0
+
+	for {
+		select {
+		case wallet := <-fanout:
+			found := false
+			for i := 0; i < len(suffixes); i++ {
+				if suffixes[i] == strings.ToLower(
+					wallet.Addr.String()[walletLength-len(suffixes[i]):],
+				) {
+					found = true
+					break
+				}
+			}
+
+			if found {
+				_, err := seedFile.WriteString(
+					wallet.Addr.String() + " " + string(wallet.Seed[:wallet.SeedSize]) + "\n",
+				)
+				if err != nil {
+					log.Fatalln("write seed file:", err.Error())
+					return
+				}
+
+				_, err = addrFile.WriteString(wallet.Addr.String() + "\n")
+				if err != nil {
+					log.Fatalln("write addr file:", err.Error())
+					return
+				}
+
+				log.Println(wallet.Addr.String())
+			}
+
+			total++
+			if total%100 == 0 {
+				log.Println(
+					"total:",
+					total,
+					"time:",
+					time.Since(started),
+					"avg w/s:",
+					float64(total)/time.Since(started).Seconds(),
+					"avg w/m:",
+					float64(total)/time.Since(started).Minutes(),
+				)
+			}
+
+			seedPool.Put(wallet.Seed)
+			wallet.Addr = nil
+			wallet.Seed = nil
+			walletPool.Put(wallet)
+
+		case <-ticker.C:
 			log.Println(
-				"total:",
-				total,
-				"time:",
-				time.Since(started),
-				"avg w/s:",
-				float64(total)/time.Since(started).Seconds(),
+				"[ticker] since last tick:", total-lastTotal,
+				"speed w/m:", float64(total-lastTotal)/time.Since(lastTick).Minutes(),
 			)
 		}
 	}
