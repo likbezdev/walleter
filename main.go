@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/hmac"
+	"math/rand/v2"
 
 	//"crypto/rand"
 	"crypto/sha512"
@@ -14,8 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	fastrand "github.com/valyala/fastrand"
 
 	"github.com/docopt/docopt-go"
 	//"github.com/xdg-go/pbkdf2"
@@ -33,7 +32,7 @@ const (
 )
 
 var (
-	usage = `walleter 1.0
+	usage = `walleter 1.1
 
 Usage:
   walleter [options] -t <threads> <suffix>...
@@ -192,7 +191,7 @@ func NewWallet() ([]byte, int, *address.Address) {
 	for {
 		size := 0
 		for i := 0; i < _Words; i++ {
-			x := fastrand.Uint32n(_wordsSizeUint32)
+			x := rand.IntN(_wordsSizeUint32)
 
 			for w := 0; w < len(wordsArr[x]); w++ {
 				seed[size+w] = wordsArr[x][w]

@@ -13,7 +13,7 @@ var wordsArr = func() []string {
 var (
 	_maxSeedSize     = 215
 	_wordsSize       = big.NewInt(int64(len(wordsArr)))
-	_wordsSizeUint32 = uint32(len(wordsArr))
+	_wordsSizeUint32 = len(wordsArr)
 )
 
 var words = map[string]bool{
